@@ -17,9 +17,10 @@ pub fn host_device() -> Option<ID3D12Device> {
 /// A title texture's host copy, refreshed and moved to the host resource
 /// `state` in the title list `list`, and the state it is in: `state` without
 /// the bits the host copy cannot take (see `host::legal_state`). What the
-/// list records next finds it there and must leave it there. The list holds
-/// the texture until it is reset. `None` for a buffer, or without a host
-/// list.
+/// list records next finds it there and must leave it there. Requesting
+/// `COPY_DEST` declares a host write when this list is submitted. The list
+/// holds the texture until it is reset. `None` for a buffer, or without a
+/// host list.
 pub fn host_texture(
     list: *const Object,
     resource: *const Object,
@@ -40,6 +41,7 @@ fn host_texture_for(
 ) -> Option<(ID3D12Resource, u32)> {
     const READ: u32 = 0x40 | 0x80 | 0x800; // shader resource, copy source
     const TARGET: u32 = 0x4 | 0x8 | 0x10; // render target, unordered access, depth write
+    const COPY_DEST: u32 = 0x400;
     copy.stamp();
     if state & READ != 0 && state & TARGET == 0 {
         if let Some(from) = crate::resource::alias_source_for(resource, copy) {
@@ -73,6 +75,9 @@ fn host_texture_for(
         unsafe { host.list.ResourceBarrier(&[barrier]) };
     }
     let state = crate::host::legal_state(&copy.texture, state);
+    if state == COPY_DEST && crate::texture::title_written(&copy.texture) {
+        crate::texture::host_writes_copy(host, copy);
+    }
     Some((copy.texture.clone(), state))
 }
 
@@ -326,7 +331,78 @@ mod tests {
         }
         assert!(crate::texture::uploads(tex) >= 2);
 
+        // The reusable upload list still holds the staging page tracker.
+        assert!(crate::bindless::uploads(&[], &[]).is_none());
         for o in [tex, list, allocator] {
+            assert_eq!(release(o), 0);
+        }
+        crate::watch::tests::free(pool);
+    }
+
+    #[test]
+    fn external_copy_dest_keeps_host_texels_on_later_submissions() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let pool = crate::watch::tests::pool(1);
+        let tex = texture_at(pool as u64, &texture_words(4, 4, 28, 1, 0));
+        let title_texel = 0xff33_2211u32;
+        let host_texel = 0xffcc_bbaau32;
+        // SAFETY: the first texel of a committed page.
+        unsafe { (pool as *mut u32).write_volatile(title_texel) };
+
+        let (reader_allocator, reader) = new_title_list();
+        let (texture, state) = host_texture(reader, tex, COPY_SOURCE).unwrap();
+        assert_eq!(state, COPY_SOURCE);
+        let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0;
+        // SAFETY: live host texture and sized outputs.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &texture.GetDesc(),
+                0,
+                1,
+                0,
+                Some(&mut fp),
+                None,
+                None,
+                Some(&mut total),
+            );
+        }
+        let readback = readback_buffer(&host.device, total);
+        let (dst, src) = copy_locations(&readback, fp, &texture);
+        // SAFETY: the list is open and both resources are in their copy states.
+        record(reader, |l| unsafe { l.CopyTextureRegion(&dst, 0, 0, 0, &src, None) })
+            .unwrap();
+        close_list(reader);
+
+        let (writer_allocator, writer) = new_title_list();
+        let (texture, state) = host_texture(writer, tex, COPY_DEST).unwrap();
+        assert_eq!(state, COPY_DEST);
+        let (upload, mapped) = host.upload_buffer(total).unwrap();
+        // SAFETY: the upload buffer contains the first texel of the footprint.
+        unsafe { mapped.cast::<u32>().write(host_texel) };
+        let (src, dst) = copy_locations(&upload, fp, &texture);
+        let one_texel = D3D12_BOX { right: 1, bottom: 1, back: 1, ..Default::default() };
+        // SAFETY: the list is open and both resources are in their copy states.
+        record(writer, |l| unsafe {
+            l.CopyTextureRegion(&dst, 0, 0, 0, &src, Some(&one_texel))
+        })
+        .unwrap();
+        close_list(writer);
+
+        let reading = crate::list::host_list(reader).unwrap();
+        host.execute(&[reading]);
+        assert_eq!(readback_value::<u32>(&readback), title_texel);
+
+        // SAFETY: the first texel of a committed page.
+        unsafe { (pool as *mut u32).write_volatile(0xff66_5544) };
+        host.execute(&[crate::list::host_list(writer).unwrap()]);
+        host.execute(&[reading]);
+        assert_eq!(host.log_messages(), None);
+        assert_eq!(readback_value::<u32>(&readback), host_texel);
+
+        for o in [reader, writer, reader_allocator, writer_allocator, tex] {
             assert_eq!(release(o), 0);
         }
         crate::watch::tests::free(pool);
@@ -424,6 +500,8 @@ mod tests {
         assert_eq!(readback_value::<[u32; 2]>(&readback), [0xf800_f800, 0]);
 
         reset_list(list, allocator);
+        // Retire the upload list's copy before the next pool can reuse its address.
+        assert!(crate::bindless::uploads(&[], &[]).is_none());
         drop(writer_copy);
         for o in [placed, writer, list, allocator] {
             assert_eq!(release(o), 0);
@@ -678,6 +756,8 @@ mod tests {
         assert_eq!(readback_value::<u32>(&ureadback), 0xff77_6655);
 
         reset_list(list, allocator);
+        // Drop the upload list's staging reference before freeing the pool.
+        assert!(crate::bindless::uploads(&[], &[]).is_none());
         drop((writer_copy, placed_copy, old_copy));
         for o in [tex, placed, writer, list, allocator] {
             assert_eq!(release(o), 0);
