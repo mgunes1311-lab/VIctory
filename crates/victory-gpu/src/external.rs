@@ -331,6 +331,8 @@ mod tests {
         }
         assert!(crate::texture::uploads(tex) >= 2);
 
+        // The reusable upload list still holds the staging page tracker.
+        assert!(crate::bindless::uploads(&[], &[]).is_none());
         for o in [tex, list, allocator] {
             assert_eq!(release(o), 0);
         }
@@ -498,6 +500,8 @@ mod tests {
         assert_eq!(readback_value::<[u32; 2]>(&readback), [0xf800_f800, 0]);
 
         reset_list(list, allocator);
+        // Retire the upload list's copy before the next pool can reuse its address.
+        assert!(crate::bindless::uploads(&[], &[]).is_none());
         drop(writer_copy);
         for o in [placed, writer, list, allocator] {
             assert_eq!(release(o), 0);
@@ -752,6 +756,8 @@ mod tests {
         assert_eq!(readback_value::<u32>(&ureadback), 0xff77_6655);
 
         reset_list(list, allocator);
+        // Drop the upload list's staging reference before freeing the pool.
+        assert!(crate::bindless::uploads(&[], &[]).is_none());
         drop((writer_copy, placed_copy, old_copy));
         for o in [tex, placed, writer, list, allocator] {
             assert_eq!(release(o), 0);
